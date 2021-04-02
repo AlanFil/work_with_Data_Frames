@@ -1,0 +1,154 @@
+"""
+Aby zmodyfikować instrukcje dla konkretnej marki:
+Ctrl + F -> Nazwa_Marki
+"""
+import sys
+
+import pandas as pd
+import numpy as np
+from datetime import date
+
+from keyboard import wait
+
+
+def color_negative_red(val):
+    """
+    Takes a scalar and returns a string with
+    the css property `'color: red'` for negative
+    strings, black otherwise.
+    """
+    color = 'red' if val > 0 else 'black'
+    return 'color: %s' % color
+
+
+def clean_ean(series):
+    if isinstance(series, str):
+        series = series.replace('\xa0', '').replace("'", "")
+        series = ''.join(filter(str.isdigit, series))
+        if series == '':
+            series = pd.NA
+            return series
+    return series
+
+
+if __name__ == '__main__':
+    # (1.1) wczytywanie pliku z .xlsx (nowe ceny)
+    try:
+        xl_cennik = pd.ExcelFile('samsung.xlsx')
+        marka = 'Samsung'
+    except FileNotFoundError:
+        try:
+            xl_cennik = pd.ExcelFile('sony.xlsx')
+            marka = 'Sony'
+        except FileNotFoundError:
+            try:
+                xl_cennik = pd.ExcelFile('huawei.xlsx')
+                marka = 'Huawei'
+            except FileNotFoundError:
+                print('Plik z cennikiem nie został znaleziony.')
+                print('\n\nWciśnij "Enter" by zakończyć pracę...')
+                wait("Enter")
+                sys.exit()
+
+    dfs_cenniki = {sheet_name: xl_cennik.parse(sheet_name) for sheet_name in xl_cennik.sheet_names}
+
+    # (1.2) wczytywanie raportu z Magento (bieżące ceny)
+    try:
+        raport = 'raport.csv'
+        df_raport = pd.read_csv(raport)
+    except FileNotFoundError:
+        print('Plik z raportem nie został znaleziony.')
+        print('\n\nWciśnij "Enter" by zakończyć pracę...')
+        wait("Enter")
+        sys.exit()
+
+    # (1.3) definiowanie raportu wyjściowego ze mianami
+    df_for_raport = pd.DataFrame(df_raport[['Reguła', 'Dostawca', 'Nazwa produktu', 'Stan magazynowy', 'EAN',
+                                            'Status produktu', 'Cena aktualna', 'Cena promocyjna', 'Cena']])
+    df_for_raport = df_for_raport.rename(columns={'Cena': 'Cena stara'})
+
+    # (2) przygotowanie każdego arkusza, aby miał nazwy kolumn: EAN, 3 x netto, RECO
+    sheets_names = [sheet_name for sheet_name in dfs_cenniki.keys() if
+                    sheet_name != 'SERWIS' and sheet_name != 'XPERIA AKC']
+
+    for sheet_name in sheets_names:
+        col_names = [col_name for col_name in dfs_cenniki[sheet_name].columns]
+
+        # jeżeli columny nie mają nazw, to weź je z pierwszego wiersza
+        while 'EAN' not in col_names:
+            dfs_cenniki[sheet_name].columns = dfs_cenniki[sheet_name].iloc[0]  # weź nazwy kolumn z pierwszego wiersza
+            dfs_cenniki[sheet_name] = dfs_cenniki[sheet_name][1:]  # usuń pierwszy wiersz
+            col_names = [col_name for col_name in dfs_cenniki[sheet_name].columns]  # sprawdź ponownie nazwy kolumn
+
+        # sprawdź czy kolumna "3 x netto" została znaleziona
+        if '3 x netto' not in col_names:
+            dfs_cenniki[sheet_name] = dfs_cenniki[sheet_name].rename(
+                columns={'cena zakupu brutto': '3 x netto', 'CENA': '3 x netto',
+                         'OI-SOA-CHM': '3 x netto', 'N/N-CHM': '3 x netto',
+                         'cena fvat': '3 x netto'})
+
+        # sprawdź czy kolumna "RECO" została znaleziona
+        if 'RECO' not in col_names:
+            col_names = [col_name for col_name in dfs_cenniki[sheet_name].columns]
+            if 'BRUTTO' in col_names and 'STREET' in col_names and marka == 'Sony':
+                for i, value in enumerate(dfs_cenniki[sheet_name].BRUTTO):
+                    street = dfs_cenniki[sheet_name].STREET[i + 1]
+                    brutto = dfs_cenniki[sheet_name].BRUTTO[i + 1]
+                    dfs_cenniki[sheet_name].BRUTTO[i + 1] = street if street > brutto else brutto
+                dfs_cenniki[sheet_name] = dfs_cenniki[sheet_name].drop(columns=['STREET'])
+
+            dfs_cenniki[sheet_name] = dfs_cenniki[sheet_name].rename(
+                columns={'BRUTTO': 'RECO', 'sugerowana cena detaliczna brutto*': 'RECO', 'STREET': 'RECO'})
+
+            if 'RECO' not in [col_name for col_name in dfs_cenniki[sheet_name].columns]:
+                dfs_cenniki[sheet_name]['RECO'] = 0
+
+        if marka == 'Samsung':  # Samsung
+            # wyrzuć wartości, które mogą powodować problemy podczas operacji matematynczych
+            dfs_cenniki[sheet_name] = dfs_cenniki[sheet_name][dfs_cenniki[sheet_name]['3 x netto'] != 'cennik online']
+            dfs_cenniki[sheet_name] = dfs_cenniki[sheet_name][dfs_cenniki[sheet_name]['EAN'] != 'TBC']
+
+            # dla arkusza "ACC" wprowadź 7% wsparcia
+            # if sheet_name == "ACC":
+            #     dfs_cenniki[sheet_name]['3 x netto'] *= 0.93
+
+    # (3) wczytywanie danych z akruszy do jednego dataframe'a "df_changes"
+    df_temp = [dfs_cenniki[sheet_name][['EAN', '3 x netto', 'RECO']] for sheet_name in sheets_names]
+
+    df_changes_raw = pd.DataFrame(columns=['EAN', '3 x netto', 'RECO'])
+    for sheet_temp in df_temp:
+        df_changes_raw = df_changes_raw.append(sheet_temp)
+
+    # (4) czyszczenie eanów
+    df_changes_raw['EAN'] = df_changes_raw['EAN'].apply(clean_ean)
+    df_changes_raw = df_changes_raw.dropna(subset=['EAN'])
+    df_changes_raw['EAN'] = df_changes_raw['EAN'].astype('float').round(0).apply(np.int64)
+
+    # (5) usuwanie duplikatów
+    df_changes_raw.drop_duplicates('EAN', inplace=True)
+
+    # (6) czyszczenie z pustych wartości w "3 x netto"
+    df_changes_raw = df_changes_raw.dropna(subset=['3 x netto'])
+    df_changes_raw = df_changes_raw[df_changes_raw['3 x netto'] != 0]
+
+    # (7) zamiana wartości netto na brutto
+    if marka != 'Huawei':  # Huawei
+        df_changes_raw['3 x netto'] *= 1.23
+    # zaokrąglenie do dwóch miejsc po przecinku
+    df_changes_raw['3 x netto'] = df_changes_raw['3 x netto'].astype(float).round(2)
+    df_changes_raw = df_changes_raw.rename(columns={'3 x netto': 'Cena nowa'})
+
+    # (8) połączenie (inner join) danych z cenników do bieżących cen i wykazanie różnic
+    df_changes = pd.merge(df_for_raport, df_changes_raw, on="EAN", how="inner")
+    df_changes = df_changes.where(df_changes['Cena stara'] != df_changes['Cena nowa']).dropna(axis='index', how='all')
+
+    # tworzeie dataframe pod plik do wczytania do kalkulacji
+    df_matrix = df_changes[['EAN', 'Cena nowa']]
+
+    # dodatki
+    df_changes['Różnica'] = df_changes['Cena nowa'] - df_changes['Cena stara']
+    # df_changes = df_changes.sort_values(by=['Różnica', 'Nazwa produktu'])
+
+    # zapisywanie zmian cennika
+    df_changes.to_excel(f'Zmiany {marka} {date.today().strftime("%d.%m.%Y")}.xlsx', index=False, engine='xlsxwriter')
+    df_matrix.to_excel('Matrix.xlsx', index=False, header=False)
